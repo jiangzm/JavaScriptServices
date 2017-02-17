@@ -6,21 +6,34 @@ import * as _ from 'lodash';
 import * as mkdirp from 'mkdirp';
 import * as rimraf from 'rimraf';
 import * as childProcess from 'child_process';
+import * as targz from 'tar.gz';
 
 const isWindows = /^win/.test(process.platform);
-const textFileExtensions = ['.gitignore', 'template_gitignore', '.config', '.cs', '.cshtml', 'Dockerfile', '.html', '.js', '.json', '.jsx', '.md', '.nuspec', '.ts', '.tsx', '.xproj'];
+const textFileExtensions = ['.gitignore', 'template_gitignore', '.config', '.cs', '.cshtml', '.csproj', 'Dockerfile', '.html', '.js', '.json', '.jsx', '.md', '.nuspec', '.ts', '.tsx', '.xproj'];
 const yeomanGeneratorSource = './src/yeoman';
 
-const templates: { [key: string]: { dir: string, dotNetNewId: string, displayName: string, forceInclusion?: RegExp } } = {
-    'angular-2': { dir: '../../templates/Angular2Spa/', dotNetNewId: 'Angular', displayName: 'Angular 2', forceInclusion: /^(wwwroot|ClientApp)\/dist\// },
+// To support the "dotnet new" templates, we want to bundle prebuilt dist dev-mode files, because "dotnet new" can't auto-run
+// webpack on project creation. Note that these script entries are *not* the same as the project's usual prepublish
+// scripts, because here we want dev-mode builds (e.g., to support HMR), not prod-mode builds.
+const commonTemplatePrepublishSteps = [
+    'npm install',
+    'node node_modules/webpack/bin/webpack.js --config webpack.config.vendor.js',
+    'node node_modules/webpack/bin/webpack.js'
+];
+const commonForceInclusionRegex = /^(wwwroot|ClientApp)\/dist\//; // Files to be included in template, even though gitignored
+
+const templates: { [key: string]: { dir: string, dotNetNewId: string, displayName: string, prepublish?: string[], forceInclusion?: RegExp } } = {
+    'angular': { dir: '../../templates/Angular2Spa/', dotNetNewId: 'Angular', displayName: 'Angular' },
     'aurelia': { dir: '../../templates/AureliaSpa/', dotNetNewId: 'Aurelia', displayName: 'Aurelia' },
     'knockout': { dir: '../../templates/KnockoutSpa/', dotNetNewId: 'Knockout', displayName: 'Knockout.js' },
     'react-redux': { dir: '../../templates/ReactReduxSpa/', dotNetNewId: 'ReactRedux', displayName: 'React.js and Redux' },
     'react': { dir: '../../templates/ReactSpa/', dotNetNewId: 'React', displayName: 'React.js' }
 };
 
+
 function isTextFile(filename: string): boolean {
-    return textFileExtensions.indexOf(path.extname(filename).toLowerCase()) >= 0;
+    return textFileExtensions.indexOf(path.extname(filename).toLowerCase()) >= 0
+        || textFileExtensions.indexOf(path.basename(filename)) >= 0;
 }
 
 function writeFileEnsuringDirExists(root: string, filename: string, contents: string | Buffer) {
@@ -72,25 +85,32 @@ function copyRecursive(sourceRoot: string, destRoot: string, matchGlob: string) 
         });
 }
 
-function buildYeomanNpmPackage() {
-    const outputRoot = './dist/generator-aspnetcore-spa';
+function buildYeomanNpmPackage(outputRoot: string) {
     const outputTemplatesRoot = path.join(outputRoot, 'app/templates');
     rimraf.sync(outputTemplatesRoot);
 
     // Copy template files
     const filenameReplacements = [
-        { from: /.*\.xproj$/, to: 'tokenreplace-namePascalCase.xproj' }
+        { from: /.*\.xproj$/, to: 'tokenreplace-namePascalCase.xproj' },
+        { from: /.*\.csproj$/, to: 'tokenreplace-namePascalCase.csproj' }
     ];
     const contentReplacements = [
+        // Dockerfile items
+        { from: /FROM microsoft\/dotnet:1.1.0-sdk-projectjson/g, to: 'FROM <%= dockerBaseImage %>' },
+
+        // .xproj items
         { from: /\bWebApplicationBasic\b/g, to: '<%= namePascalCase %>' },
         { from: /<ProjectGuid>[0-9a-f\-]{36}<\/ProjectGuid>/g, to: '<ProjectGuid><%= projectGuid %></ProjectGuid>' },
         { from: /<RootNamespace>.*?<\/RootNamespace>/g, to: '<RootNamespace><%= namePascalCase %></RootNamespace>'},
         { from: /\s*<BaseIntermediateOutputPath.*?<\/BaseIntermediateOutputPath>/g, to: '' },
         { from: /\s*<OutputPath.*?<\/OutputPath>/g, to: '' },
+
+        // global.json items
+        { from: /1\.0\.0-preview2-1-003177/, to: '<%= sdkVersion %>' }
     ];
     _.forEach(templates, (templateConfig, templateName) => {
         const outputDir = path.join(outputTemplatesRoot, templateName);
-        writeTemplate(templateConfig.dir, outputDir, contentReplacements, filenameReplacements, templateConfig.forceInclusion);
+        writeTemplate(templateConfig.dir, outputDir, contentReplacements, filenameReplacements, commonForceInclusionRegex);
     });
 
     // Also copy the generator files (that's the compiled .js files, plus all other non-.ts files)
@@ -110,35 +130,50 @@ function buildDotNetNewNuGetPackage() {
     const sourceProjectName = 'WebApplicationBasic';
     const projectGuid = '00000000-0000-0000-0000-000000000000';
     const filenameReplacements = [
-        { from: /.*\.xproj$/, to: `${sourceProjectName}.xproj` },
-        { from: /\btemplate_gitignore$/, to: '.gitignore' },
-
-        // Workaround for https://github.com/aspnet/JavaScriptServices/issues/235
-        // For details, see the comment in ../yeoman/app/index.ts
-        { from: /\btemplate_nodemodules_placeholder.txt$/, to: 'node_modules/_placeholder.txt' }
+        { from: /.*\.csproj$/, to: `${sourceProjectName}.csproj` },
+        { from: /\btemplate_gitignore$/, to: '.gitignore' }
     ];
-    const contentReplacements = [
-        { from: /<ProjectGuid>[0-9a-f\-]{36}<\/ProjectGuid>/g, to: `<ProjectGuid>${projectGuid}</ProjectGuid>` },
-        { from: /<RootNamespace>.*?<\/RootNamespace>/g, to: `<RootNamespace>${sourceProjectName}</RootNamespace>`},
-        { from: /\s*<BaseIntermediateOutputPath.*?<\/BaseIntermediateOutputPath>/g, to: '' },
-        { from: /\s*<OutputPath.*?<\/OutputPath>/g, to: '' },
-    ];
+    const contentReplacements = [];
     _.forEach(templates, (templateConfig, templateName) => {
-        const templateOutputDir = path.join(outputRoot, 'templates', templateName);
-        const templateOutputProjectDir = path.join(templateOutputDir, sourceProjectName);
-        writeTemplate(templateConfig.dir, templateOutputProjectDir, contentReplacements, filenameReplacements, templateConfig.forceInclusion);
+        const templateOutputDir = path.join(outputRoot, 'Content', templateName);
+        writeTemplate(templateConfig.dir, templateOutputDir, contentReplacements, filenameReplacements, commonForceInclusionRegex);
 
-        // Add a .netnew.json file
-        fs.writeFileSync(path.join(templateOutputDir, '.netnew.json'), JSON.stringify({
+        // Add the .template.config dir and its contents
+        const templateConfigDir = path.join(templateOutputDir, '.template.config');
+        mkdirp.sync(templateConfigDir);
+
+        fs.writeFileSync(path.join(templateConfigDir, 'template.json'), JSON.stringify({
             author: 'Microsoft',
-            classifications: [ 'Standard>>Quick Starts' ],
-            name: `ASP.NET Core SPA with ${templateConfig.displayName}`,
-            groupIdentity: `Microsoft.AspNetCore.Spa.${templateConfig.dotNetNewId}`,
-            identity: `Microsoft.AspNetCore.Spa.${templateConfig.dotNetNewId}`,
-            shortName: `aspnetcorespa-${templateConfig.dotNetNewId.toLowerCase()}`,
-            tags: { language: 'C#' },
-            guids: [ projectGuid ],
-            sourceName: sourceProjectName
+            classifications: ["Web", "MVC", "SPA"],
+            groupIdentity: `Microsoft.AspNetCore.SpaTemplates.${templateConfig.dotNetNewId}`,
+            identity: `Microsoft.AspNetCore.SpaTemplates.${templateConfig.dotNetNewId}.CSharp`,
+            name: `MVC ASP.NET Core with ${templateConfig.displayName}`,
+            preferNameDirectory: true,
+            primaryOutputs: [{ path: `${sourceProjectName}.csproj` }],
+            shortName: `${templateConfig.dotNetNewId.toLowerCase()}`,
+            sourceName: sourceProjectName,
+            sources: [{
+                source: './',
+                target: './',
+                exclude: ['.deployment', '.template.config/**', 'project.json', '*.xproj', '**/_placeholder.txt']
+            }],
+            symbols: {
+                sdkVersion: {
+                    type: 'bind',
+                    binding: 'dotnet-cli-version',
+                    replaces: '1.0.0-preview2-1-003177'
+                },
+                dockerBaseImage: {
+                    type: 'parameter',
+                    replaces: 'microsoft/dotnet:1.1.0-sdk-projectjson',
+                    defaultValue: 'microsoft/dotnet:1.1.0-sdk-msbuild'
+                }
+            },
+            tags: { language: 'C#', type: 'project' },
+        }, null, 2));
+
+        fs.writeFileSync(path.join(templateConfigDir, 'dotnetcli.host.json'), JSON.stringify({
+            symbolInfo: {}
         }, null, 2));
     });
 
@@ -159,23 +194,49 @@ function buildDotNetNewNuGetPackage() {
 
     // Clean up
     rimraf.sync('./tmp');
+
+    return glob.sync(path.join(outputRoot, './*.nupkg'))[0];
 }
 
-// TODO: Instead of just showing this warning, improve build script so it actually does build them
-// in the correct format. Can do this once we've moved away from using ASPNETCORE_ENVIRONMENT to
-// control the build output mode. The templates we warn about here are the ones where we ship some
-// files that wouldn't normally be under source control (e.g., /wwwroot/dist/*).
-const templatesWithForceIncludes = Object.getOwnPropertyNames(templates)
-    .filter(templateName => !!templates[templateName].forceInclusion);
-if (templatesWithForceIncludes.length > 0) {
-    console.warn(`
----
-WARNING: Ensure that the following templates are already built in the configuration desired for publishing.
-For example, build the dist files in debug mode.
-TEMPLATES: ${templatesWithForceIncludes.join(', ')}
----
-`);
+function runAllPrepublishScripts() {
+    Object.getOwnPropertyNames(templates).forEach(templateKey => {
+        const templateInfo = templates[templateKey];
+
+        // First run standard prepublish steps
+        runScripts(templateInfo.dir, commonTemplatePrepublishSteps);
+
+        // Second, run any template-specific prepublish steps
+        if (templateInfo.prepublish) {
+            runScripts(templateInfo.dir, templateInfo.prepublish);
+        }
+    });
 }
 
-buildYeomanNpmPackage();
-buildDotNetNewNuGetPackage();
+function runScripts(rootDir: string, scripts: string[]) {
+    console.log(`[Prepublish] In directory: ${ rootDir }`);
+    scripts.forEach(script => {
+        console.log(`[Prepublish] Running: ${ script }`);
+        childProcess.execSync(script, { cwd: rootDir, stdio: 'inherit' });
+    });
+    console.log(`[Prepublish] Done`)
+}
+
+const distDir = './dist';
+const artifactsDir = path.join(distDir, 'artifacts');
+const yeomanOutputRoot = path.join(distDir, 'generator-aspnetcore-spa');
+
+rimraf.sync(distDir);
+mkdirp.sync(artifactsDir);
+runAllPrepublishScripts();
+buildYeomanNpmPackage(yeomanOutputRoot);
+const dotNetNewNupkgPath = buildDotNetNewNuGetPackage();
+
+// Move the .nupkg file to the artifacts dir
+fs.renameSync(dotNetNewNupkgPath, path.join(artifactsDir, path.basename(dotNetNewNupkgPath)));
+
+// Finally, create a .tar.gz file containing the built generator-aspnetcore-spa.
+// The CI system can treat this as the final built artifact.
+// Note that the targz APIs only come in async flavor.
+targz().compress(yeomanOutputRoot, path.join(artifactsDir, 'generator-aspnetcore-spa.tar.gz'), err => {
+    if (err) { throw err; }
+});

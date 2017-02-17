@@ -4,11 +4,13 @@ import * as yeoman from 'yeoman-generator';
 import * as uuid from 'node-uuid';
 import * as glob from 'glob';
 import * as semver from 'semver';
+import * as chalk from 'chalk';
 import { execSync } from 'child_process';
 import npmWhich = require('npm-which');
 const yosay = require('yosay');
 const toPascalCase = require('to-pascal-case');
 const isWindows = /^win/.test(process.platform);
+const generatorPackageJson = require(path.resolve(__dirname, '../package.json'));
 
 // Paths matching these regexes will only be included if the user wants tests
 const testSpecificPaths = [
@@ -33,13 +35,37 @@ const testSpecificNpmPackages = [
 type YeomanPrompt = (opt: yeoman.IPromptOptions | yeoman.IPromptOptions[], callback: (answers: any) => void) => void;
 const optionOrPrompt: YeomanPrompt = require('yeoman-option-or-prompt');
 
-const templates = [
-    { value: 'angular-2', name: 'Angular 2', tests: true },
-    { value: 'aurelia', name: 'Aurelia', tests: false },
-    { value: 'knockout', name: 'Knockout', tests: false },
-    { value: 'react', name: 'React', tests: false },
-    { value: 'react-redux', name: 'React with Redux', tests: false }
+interface TemplateConfig {
+    value: string;      // Internal unique ID for Yeoman prompt
+    rootDir: string;    // Which of the template root directories should be used
+    name: string;       // Display name
+    tests: boolean;
+    mapFilenames?: { [pattern: string]: string | boolean };
+}
+
+const templates: TemplateConfig[] = [
+    { value: 'angular', rootDir: 'angular', name: 'Angular', tests: true },
+    { value: 'aurelia', rootDir: 'aurelia', name: 'Aurelia', tests: false },
+    { value: 'knockout', rootDir: 'knockout', name: 'Knockout', tests: false },
+    { value: 'react', rootDir: 'react', name: 'React', tests: false },
+    { value: 'react-redux', rootDir: 'react-redux', name: 'React with Redux', tests: false }
 ];
+
+// Once everyone is on .csproj-compatible tooling, we might be able to remove the global.json files and eliminate
+// this SDK choice altogether. That would be good because then it would work with whatever SDK version you have
+// installed. For now, we need to specify an SDK version explicitly, because there's no support for wildcards, and
+// preview3+ tooling doesn't support project.json at all.
+const sdkChoices = [{
+    value: '1.0.0-preview2-1-003177',   // Current released version
+    name: 'project.json' + chalk.gray(' (compatible with .NET Core tooling preview 2 and Visual Studio 2015)'),
+    includeFiles: [/^project.json$/, /\.xproj$/, /_placeholder.txt$/, /\.deployment$/],
+    dockerBaseImage: 'microsoft/dotnet:1.1.0-sdk-projectjson'
+}, {
+    value: '1.0.0-preview3-004056',     // Version that ships with VS2017RC
+    name: '.csproj' + chalk.gray('      (compatible with .NET Core tooling preview 3 and Visual Studio 2017)'),
+    includeFiles: [/\.csproj$/],
+    dockerBaseImage: 'microsoft/dotnet:1.1.0-sdk-msbuild'
+}];
 
 class MyGenerator extends yeoman.Base {
     private _answers: any;
@@ -48,7 +74,7 @@ class MyGenerator extends yeoman.Base {
     constructor(args: string | string[], options: any) {
         super(args, options);
         this._optionOrPrompt = optionOrPrompt;
-        this.log(yosay('Welcome to the ASP.NET Core Single-Page App generator!'));
+        this.log(yosay('Welcome to the ASP.NET Core Single-Page App generator!\n\nVersion: ' + generatorPackageJson.version));
 
         if (isWindows) {
             assertNpmVersionIsAtLeast('3.0.0');
@@ -64,8 +90,13 @@ class MyGenerator extends yeoman.Base {
             name: 'framework',
             message: 'Framework',
             choices: templates
-        }], frameworkAnswer => {
-            const frameworkChoice = templates.filter(t => t.value === frameworkAnswer.framework)[0];
+        }, {
+            type: 'list',
+            name: 'sdkVersion',
+            message: 'What type of project do you want to create?',
+            choices: sdkChoices
+        }], firstAnswers => {
+            const templateConfig = templates.filter(t => t.value === firstAnswers.framework)[0];
             const furtherQuestions = [{
                 type: 'input',
                 name: 'name',
@@ -73,7 +104,7 @@ class MyGenerator extends yeoman.Base {
                 default: this.appname
             }];
 
-            if (frameworkChoice.tests) {
+            if (templateConfig.tests) {
                 furtherQuestions.unshift({
                     type: 'confirm',
                     name: 'tests',
@@ -83,18 +114,26 @@ class MyGenerator extends yeoman.Base {
             }
 
             this._optionOrPrompt(furtherQuestions, answers => {
-                answers.framework = frameworkAnswer.framework;
+                answers.framework = firstAnswers.framework;
                 this._answers = answers;
-                this._answers.framework = frameworkAnswer.framework;
+                this._answers.framework = firstAnswers.framework;
+                this._answers.templateConfig = templateConfig;
+                this._answers.sdkVersion = firstAnswers.sdkVersion;
                 this._answers.namePascalCase = toPascalCase(answers.name);
                 this._answers.projectGuid = this.options['projectguid'] || uuid.v4();
+
+                const chosenSdk = sdkChoices.filter(sdk => sdk.value === this._answers.sdkVersion)[0];
+                this._answers.dockerBaseImage = chosenSdk.dockerBaseImage;
+
                 done();
             });
         });
     }
 
     writing() {
-        var templateRoot = this.templatePath(this._answers.framework);
+        const templateConfig = this._answers.templateConfig as TemplateConfig;
+        const templateRoot = this.templatePath(templateConfig.rootDir);
+        const chosenSdk = sdkChoices.filter(sdk => sdk.value === this._answers.sdkVersion)[0];
         glob.sync('**/*', { cwd: templateRoot, dot: true, nodir: true }).forEach(fn => {
             // Token replacement in filenames
             let outputFn = fn.replace(/tokenreplace\-([^\.\/]*)/g, (substr, token) => this._answers[token]);
@@ -104,23 +143,27 @@ class MyGenerator extends yeoman.Base {
                 outputFn = path.join(path.dirname(fn), '.gitignore');
             }
 
-            // Likewise, output template_nodemodules_placeholder.txt as node_modules/_placeholder.txt
-            // This is a workaround for https://github.com/aspnet/JavaScriptServices/issues/235. We need the new project
-            // to have a nonempty node_modules dir as far as *source control* is concerned. So, there's a gitignore
-            // rule that explicitly causes node_modules/_placeholder.txt to be tracked in source control. But how
-            // does that file get there in the first place? It's not enough for such a file to exist when the
-            // generator-aspnetcore-spa NPM package is published, because NPM doesn't allow any directories called
-            // node_modules to exist in the package. So we have a file with at a different location, and move it
-            // to node_modules as part of executing the template.
-            if (path.basename(fn) === 'template_nodemodules_placeholder.txt') {
-                outputFn = path.join(path.dirname(fn), 'node_modules', '_placeholder.txt');
+            // Perform any filename replacements configured for the template
+            const mappedFilename = applyFirstMatchingReplacement(outputFn, templateConfig.mapFilenames);
+            let fileIsExcludedByTemplateConfig = false;
+            if (typeof mappedFilename === 'string') {
+                outputFn = mappedFilename;
+            } else {
+                fileIsExcludedByTemplateConfig = (mappedFilename === false);
             }
 
-            // Exclude test-specific files (unless the user has said they want tests)
+            // Decide whether to emit this file
             const isTestSpecificFile = testSpecificPaths.some(regex => regex.test(outputFn));
-            if (this._answers.tests || !isTestSpecificFile) {
+            const isSdkSpecificFile = sdkChoices.some(sdk => sdk.includeFiles.some(regex => regex.test(outputFn)));
+            const matchesChosenSdk = chosenSdk.includeFiles.some(regex => regex.test(outputFn));
+            const emitFile = (matchesChosenSdk || !isSdkSpecificFile)
+                          && (this._answers.tests || !isTestSpecificFile)
+                          && !fileIsExcludedByTemplateConfig;
+
+            if (emitFile) {
                 let inputFullPath = path.join(templateRoot, fn);
                 let destinationFullPath = this.destinationPath(outputFn);
+                let deleteInputFileAfter = false;
                 if (path.basename(fn) === 'package.json') {
                     // Special handling for package.json, because we rewrite it dynamically
                     const tempPath = destinationFullPath + '.tmp';
@@ -131,6 +174,7 @@ class MyGenerator extends yeoman.Base {
                         /* space */ 2
                     );
                     inputFullPath = tempPath;
+                    deleteInputFileAfter = true;
                 }
 
                 const outputDirBasename = path.basename(path.dirname(destinationFullPath));
@@ -147,6 +191,10 @@ class MyGenerator extends yeoman.Base {
                         destinationFullPath,
                         this._answers
                     );
+                }
+
+                if (deleteInputFileAfter) {
+                    this.fs.delete(inputFullPath);
                 }
             }
         });
@@ -186,7 +234,7 @@ function assertNpmVersionIsAtLeast(minVersion: string) {
     const runningVersion = execSync('npm -v').toString();
     if (!semver.gte(runningVersion, minVersion, /* loose */ true)) {
         console.error(`This generator requires NPM version ${minVersion} or later. You are running NPM version ${runningVersion}`);
-        process.exit(0);
+        process.exit(1);
     }
 }
 
@@ -217,6 +265,29 @@ function rewritePackageJson(contents, includeTests) {
     }
 
     return contents;
+}
+
+function applyFirstMatchingReplacement(inputValue: string, replacements: { [pattern: string]: string | boolean }): string | boolean {
+    if (replacements) {
+        const replacementPatterns = Object.getOwnPropertyNames(replacements);
+        for (let patternIndex = 0; patternIndex < replacementPatterns.length; patternIndex++) {
+            const pattern = replacementPatterns[patternIndex];
+            const regexp = new RegExp(pattern);
+            if (regexp.test(inputValue)) {
+                const replacement = replacements[pattern];
+
+                // To avoid bug-prone evaluation order dependencies, we only respond to the first name match per file
+                if (typeof (replacement) === 'boolean') {
+                    return replacement;
+                } else {
+                    return inputValue.replace(regexp, replacement);
+                }
+            }
+        }
+    }
+
+    // No match
+    return inputValue;
 }
 
 declare var module: any;

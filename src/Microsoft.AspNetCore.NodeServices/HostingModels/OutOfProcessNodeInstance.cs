@@ -42,6 +42,7 @@ If you haven't yet installed node-inspector, you can do so as follows:
         private readonly StringAsTempFile _entryPointScript;
         private FileSystemWatcher _fileSystemWatcher;
         private int _invocationTimeoutMilliseconds;
+        private bool _launchWithDebugging;
         private readonly Process _nodeProcess;
         private int? _nodeDebuggingPort;
         private bool _nodeProcessNeedsRestart;
@@ -78,9 +79,10 @@ If you haven't yet installed node-inspector, you can do so as follows:
             OutputLogger = nodeOutputLogger;
             _entryPointScript = new StringAsTempFile(entryPointScript);
             _invocationTimeoutMilliseconds = invocationTimeoutMilliseconds;
+            _launchWithDebugging = launchWithDebugging;
 
             var startInfo = PrepareNodeProcessStartInfo(_entryPointScript.FileName, projectPath, commandLineArguments,
-                environmentVars, launchWithDebugging, debuggingPort);
+                environmentVars, _launchWithDebugging, debuggingPort);
             _nodeProcess = LaunchNodeProcess(startInfo);
             _watchFileExtensions = watchFileExtensions;
             _fileSystemWatcher = BeginFileWatcher(projectPath);
@@ -103,10 +105,17 @@ If you haven't yet installed node-inspector, you can do so as follows:
             {
                 // This special kind of exception triggers a transparent retry - NodeServicesImpl will launch
                 // a new Node instance and pass the invocation to that one instead.
+                // Note that if the Node process is listening for debugger connections, then we need it to shut
+                // down immediately and not stay open for connection draining (because if it did, the new Node
+                // instance wouldn't able to start, because the old one would still hold the debugging port).
                 var message = _nodeProcess.HasExited
                     ? "The Node process has exited"
                     : "The Node process needs to restart";
-                throw new NodeInvocationException(message, null, nodeInstanceUnavailable: true);
+                throw new NodeInvocationException(
+                    message,
+                    details: null,
+                    nodeInstanceUnavailable: true,
+                    allowConnectionDraining: !_launchWithDebugging);
             }
 
             // Construct a new cancellation token that combines the supplied token with the configured invocation
@@ -222,7 +231,7 @@ If you haven't yet installed node-inspector, you can do so as follows:
             }
             else
             {
-                debuggingArgs = string.Empty;    
+                debuggingArgs = string.Empty;
             }
 
             var thisProcessPid = Process.GetCurrentProcess().Id;
@@ -325,17 +334,26 @@ If you haven't yet installed node-inspector, you can do so as follows:
 
         private static Process LaunchNodeProcess(ProcessStartInfo startInfo)
         {
-            var process = Process.Start(startInfo);
+            try {
+                var process = Process.Start(startInfo);
 
-            // On Mac at least, a killed child process is left open as a zombie until the parent
-            // captures its exit code. We don't need the exit code for this process, and don't want
-            // to use process.WaitForExit() explicitly (we'd have to block the thread until it really
-            // has exited), but we don't want to leave zombies lying around either. It's sufficient
-            // to use process.EnableRaisingEvents so that .NET will grab the exit code and let the
-            // zombie be cleaned away without having to block our thread.
-            process.EnableRaisingEvents = true;
+                // On Mac at least, a killed child process is left open as a zombie until the parent
+                // captures its exit code. We don't need the exit code for this process, and don't want
+                // to use process.WaitForExit() explicitly (we'd have to block the thread until it really
+                // has exited), but we don't want to leave zombies lying around either. It's sufficient
+                // to use process.EnableRaisingEvents so that .NET will grab the exit code and let the
+                // zombie be cleaned away without having to block our thread.
+                process.EnableRaisingEvents = true;
 
-            return process;
+                return process;
+            } catch (Exception ex) {
+                var message = "Failed to start Node process. To resolve this:.\n\n"
+                            + "[1] Ensure that Node.js is installed and can be found in one of the PATH directories.\n"
+                            + $"    Current PATH enviroment variable is: { Environment.GetEnvironmentVariable("PATH") }\n"
+                            + "    Make sure the Node executable is in one of those directories, or update your PATH.\n\n"
+                            + "[2] See the InnerException for further details of the cause.";
+                throw new InvalidOperationException(message, ex);
+            }
         }
 
         private static string UnencodeNewlines(string str)
