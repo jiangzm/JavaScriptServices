@@ -3,6 +3,7 @@ import * as webpack from 'webpack';
 import * as url from 'url';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as querystring from 'querystring';
 import { requireNewCopy } from './RequireNewCopy';
 
 export type CreateDevServerResult = {
@@ -22,10 +23,13 @@ interface CreateDevServerOptions {
     hotModuleReplacementEndpointUrl: string;
 }
 
+type StringMap<T> = [(key: string) => T];
+
 // These are the options configured in C# and then JSON-serialized, hence the C#-style naming
 interface DevServerOptions {
     HotModuleReplacement: boolean;
     HotModuleReplacementServerPort: number;
+    HotModuleReplacementClientOptions: StringMap<string>;
     ReactHotModuleReplacement: boolean;
 }
 
@@ -37,7 +41,7 @@ interface WebpackConfigFunc {
 }
 type WebpackConfigFileExport = WebpackConfigOrArray | WebpackConfigFunc;
 
-function attachWebpackDevMiddleware(app: any, webpackConfig: webpack.Configuration, enableHotModuleReplacement: boolean, enableReactHotModuleReplacement: boolean, hmrClientEndpoint: string, hmrServerEndpoint: string) {
+function attachWebpackDevMiddleware(app: any, webpackConfig: webpack.Configuration, enableHotModuleReplacement: boolean, enableReactHotModuleReplacement: boolean, hmrClientOptions: StringMap<string>, hmrServerEndpoint: string) {
     // Build the final Webpack config based on supplied options
     if (enableHotModuleReplacement) {
         // For this, we only support the key/value config format, not string or string[], since
@@ -53,7 +57,7 @@ function attachWebpackDevMiddleware(app: any, webpackConfig: webpack.Configurati
         // Augment all entry points so they support HMR (unless they already do)
         Object.getOwnPropertyNames(entryPoints).forEach(entryPointName => {
             const webpackHotMiddlewareEntryPoint = 'webpack-hot-middleware/client';
-            const webpackHotMiddlewareOptions = `?path=` + encodeURIComponent(hmrClientEndpoint);
+            const webpackHotMiddlewareOptions = '?' + querystring.stringify(hmrClientOptions);
             if (typeof entryPoints[entryPointName] === 'string') {
                 entryPoints[entryPointName] = [webpackHotMiddlewareEntryPoint + webpackHotMiddlewareOptions, entryPoints[entryPointName]];
             } else if (firstIndexOfStringStartingWith(entryPoints[entryPointName], webpackHotMiddlewareEntryPoint) < 0) {
@@ -126,10 +130,49 @@ function attachWebpackDevMiddleware(app: any, webpackConfig: webpack.Configurati
         } catch (ex) {
             throw new Error('HotModuleReplacement failed because of an error while loading \'webpack-hot-middleware\'. Error was: ' + ex.stack);
         }
+        app.use(workaroundIISExpressEventStreamFlushingIssue(hmrServerEndpoint));
         app.use(webpackHotMiddlewareModule(compiler, {
             path: hmrServerEndpoint
         }));
     }
+}
+
+function workaroundIISExpressEventStreamFlushingIssue(path: string): connect.NextHandleFunction {
+    // IIS Express makes HMR seem very slow, because when it's reverse-proxying an EventStream response
+    // from Kestrel, it doesn't pass through the lines to the browser immediately, even if you're calling
+    // response.Flush (or equivalent) in your ASP.NET Core code. For some reason, it waits until the following
+    // line is sent. By default, that wouldn't be until the next HMR heartbeat, which can be up to 5 seconds later.
+    // In effect, it looks as if your code is taking 5 seconds longer to compile than it really does.
+    //
+    // As a workaround, this connect middleware intercepts requests to the HMR endpoint, and modifies the response
+    // stream so that all EventStream 'data' lines are immediately followed with a further blank line. This is
+    // harmless in non-IIS-Express cases, because it's OK to have extra blank lines in an EventStream response.
+    // The implementation is simplistic - rather than using a true stream reader, we just patch the 'write'
+    // method. This relies on webpack's HMR code always writing complete EventStream messages with a single
+    // 'write' call. That works fine today, but if webpack's HMR code was changed, this workaround might have
+    // to be updated.
+    const eventStreamLineStart = /^data\:/;
+    return (req, res, next) => {
+        // We only want to interfere with requests to the HMR endpoint, so check this request matches
+        const urlMatchesPath = (req.url === path) || (req.url.split('?', 1)[0] === path);
+        if (urlMatchesPath) {
+            const origWrite = res.write;
+            res.write = function (chunk) {
+                const result = origWrite.apply(this, arguments);
+
+                // We only want to interfere with actual EventStream data lines, so check it is one
+                if (typeof (chunk) === 'string') {
+                    if (eventStreamLineStart.test(chunk) && chunk.charAt(chunk.length - 1) === '\n') {
+                        origWrite.call(this, '\n\n');
+                    }
+                }
+
+                return result;
+            }
+        }
+
+        return next();
+    };
 }
 
 function copyRecursiveToRealFsSync(from: typeof fs, rootDir: string, exclude: RegExp[]) {
@@ -224,7 +267,12 @@ export function createWebpackDevServer(callback: CreateDevServerCallback, option
                         || `http://localhost:${listener.address().port}/__webpack_hmr`; // Fall back on absolute URL to bypass proxying
                     const hmrServerEndpoint = options.hotModuleReplacementEndpointUrl
                         || '/__webpack_hmr';                                            // URL is relative to webpack dev server root
-                    attachWebpackDevMiddleware(app, webpackConfig, enableHotModuleReplacement, enableReactHotModuleReplacement, hmrClientEndpoint, hmrServerEndpoint);
+
+                    // We always overwrite the 'path' option as it needs to match what the .NET side is expecting
+                    const hmrClientOptions = options.suppliedOptions.HotModuleReplacementClientOptions || <StringMap<string>>{};
+                    hmrClientOptions['path'] = hmrClientEndpoint;
+
+                    attachWebpackDevMiddleware(app, webpackConfig, enableHotModuleReplacement, enableReactHotModuleReplacement, hmrClientOptions, hmrServerEndpoint);
                 }
             });
 

@@ -40,7 +40,6 @@ interface TemplateConfig {
     rootDir: string;    // Which of the template root directories should be used
     name: string;       // Display name
     tests: boolean;
-    mapFilenames?: { [pattern: string]: string | boolean };
 }
 
 const templates: TemplateConfig[] = [
@@ -48,24 +47,9 @@ const templates: TemplateConfig[] = [
     { value: 'aurelia', rootDir: 'aurelia', name: 'Aurelia', tests: false },
     { value: 'knockout', rootDir: 'knockout', name: 'Knockout', tests: false },
     { value: 'react', rootDir: 'react', name: 'React', tests: false },
-    { value: 'react-redux', rootDir: 'react-redux', name: 'React with Redux', tests: false }
+    { value: 'react-redux', rootDir: 'react-redux', name: 'React with Redux', tests: false },
+    { value: 'vue', rootDir: 'vue', name: 'Vue', tests: false }
 ];
-
-// Once everyone is on .csproj-compatible tooling, we might be able to remove the global.json files and eliminate
-// this SDK choice altogether. That would be good because then it would work with whatever SDK version you have
-// installed. For now, we need to specify an SDK version explicitly, because there's no support for wildcards, and
-// preview3+ tooling doesn't support project.json at all.
-const sdkChoices = [{
-    value: '1.0.0-preview2-1-003177',   // Current released version
-    name: 'project.json' + chalk.gray(' (compatible with .NET Core tooling preview 2 and Visual Studio 2015)'),
-    includeFiles: [/^project.json$/, /\.xproj$/, /_placeholder.txt$/, /\.deployment$/],
-    dockerBaseImage: 'microsoft/dotnet:1.1.0-sdk-projectjson'
-}, {
-    value: '1.0.0-preview3-004056',     // Version that ships with VS2017RC
-    name: '.csproj' + chalk.gray('      (compatible with .NET Core tooling preview 3 and Visual Studio 2017)'),
-    includeFiles: [/\.csproj$/],
-    dockerBaseImage: 'microsoft/dotnet:1.1.0-sdk-msbuild'
-}];
 
 class MyGenerator extends yeoman.Base {
     private _answers: any;
@@ -79,6 +63,8 @@ class MyGenerator extends yeoman.Base {
         if (isWindows) {
             assertNpmVersionIsAtLeast('3.0.0');
         }
+
+        assertDotNetSDKVersionIsAtLeast('1.0.0');
     }
 
     prompting() {
@@ -90,11 +76,6 @@ class MyGenerator extends yeoman.Base {
             name: 'framework',
             message: 'Framework',
             choices: templates
-        }, {
-            type: 'list',
-            name: 'sdkVersion',
-            message: 'What type of project do you want to create?',
-            choices: sdkChoices
         }], firstAnswers => {
             const templateConfig = templates.filter(t => t.value === firstAnswers.framework)[0];
             const furtherQuestions = [{
@@ -118,12 +99,9 @@ class MyGenerator extends yeoman.Base {
                 this._answers = answers;
                 this._answers.framework = firstAnswers.framework;
                 this._answers.templateConfig = templateConfig;
-                this._answers.sdkVersion = firstAnswers.sdkVersion;
                 this._answers.namePascalCase = toPascalCase(answers.name);
                 this._answers.projectGuid = this.options['projectguid'] || uuid.v4();
-
-                const chosenSdk = sdkChoices.filter(sdk => sdk.value === this._answers.sdkVersion)[0];
-                this._answers.dockerBaseImage = chosenSdk.dockerBaseImage;
+                this._answers.sdkVersion = getDotNetSDKVersion();
 
                 done();
             });
@@ -133,7 +111,6 @@ class MyGenerator extends yeoman.Base {
     writing() {
         const templateConfig = this._answers.templateConfig as TemplateConfig;
         const templateRoot = this.templatePath(templateConfig.rootDir);
-        const chosenSdk = sdkChoices.filter(sdk => sdk.value === this._answers.sdkVersion)[0];
         glob.sync('**/*', { cwd: templateRoot, dot: true, nodir: true }).forEach(fn => {
             // Token replacement in filenames
             let outputFn = fn.replace(/tokenreplace\-([^\.\/]*)/g, (substr, token) => this._answers[token]);
@@ -143,22 +120,9 @@ class MyGenerator extends yeoman.Base {
                 outputFn = path.join(path.dirname(fn), '.gitignore');
             }
 
-            // Perform any filename replacements configured for the template
-            const mappedFilename = applyFirstMatchingReplacement(outputFn, templateConfig.mapFilenames);
-            let fileIsExcludedByTemplateConfig = false;
-            if (typeof mappedFilename === 'string') {
-                outputFn = mappedFilename;
-            } else {
-                fileIsExcludedByTemplateConfig = (mappedFilename === false);
-            }
-
             // Decide whether to emit this file
             const isTestSpecificFile = testSpecificPaths.some(regex => regex.test(outputFn));
-            const isSdkSpecificFile = sdkChoices.some(sdk => sdk.includeFiles.some(regex => regex.test(outputFn)));
-            const matchesChosenSdk = chosenSdk.includeFiles.some(regex => regex.test(outputFn));
-            const emitFile = (matchesChosenSdk || !isSdkSpecificFile)
-                          && (this._answers.tests || !isTestSpecificFile)
-                          && !fileIsExcludedByTemplateConfig;
+            const emitFile = (this._answers.tests || !isTestSpecificFile);
 
             if (emitFile) {
                 let inputFullPath = path.join(templateRoot, fn);
@@ -238,6 +202,27 @@ function assertNpmVersionIsAtLeast(minVersion: string) {
     }
 }
 
+function assertDotNetSDKVersionIsAtLeast(minVersion: string) {
+    const runningVersion = getDotNetSDKVersion();
+    if (!runningVersion) {
+        console.error('Could not find dotnet tool on system path. Please install dotnet core SDK then try again.');
+        console.error('Try running "dotnet --version" to verify you have it.');
+        process.exit(1);
+    } else if (!semver.gte(runningVersion, minVersion, /* loose */ true)) {
+        console.error(`This generator requires dotnet SDK version ${minVersion} or later. You have version ${runningVersion}`);
+        console.error('Please update your dotnet SDK then try again. You can run "dotnet --version" to check your version.');
+        process.exit(1);
+    }
+}
+
+function getDotNetSDKVersion() {
+    try {
+        return execSync('dotnet --version').toString().replace(/\r|\n/g, '');
+    } catch (ex) {
+        return null;
+    }
+}
+
 function rewritePackageJson(contents, includeTests) {
     if (!includeTests) {
         // Delete any test-specific packages from dependencies and devDependencies
@@ -265,29 +250,6 @@ function rewritePackageJson(contents, includeTests) {
     }
 
     return contents;
-}
-
-function applyFirstMatchingReplacement(inputValue: string, replacements: { [pattern: string]: string | boolean }): string | boolean {
-    if (replacements) {
-        const replacementPatterns = Object.getOwnPropertyNames(replacements);
-        for (let patternIndex = 0; patternIndex < replacementPatterns.length; patternIndex++) {
-            const pattern = replacementPatterns[patternIndex];
-            const regexp = new RegExp(pattern);
-            if (regexp.test(inputValue)) {
-                const replacement = replacements[pattern];
-
-                // To avoid bug-prone evaluation order dependencies, we only respond to the first name match per file
-                if (typeof (replacement) === 'boolean') {
-                    return replacement;
-                } else {
-                    return inputValue.replace(regexp, replacement);
-                }
-            }
-        }
-    }
-
-    // No match
-    return inputValue;
 }
 
 declare var module: any;
