@@ -17,6 +17,7 @@ namespace NodeServicesExamples
 
             // Enable Node Services
             services.AddNodeServices();
+            services.AddSpaPrerenderer();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -41,7 +42,6 @@ namespace NodeServicesExamples
             });
 
             app.UseStaticFiles();
-            loggerFactory.AddConsole();
             app.UseMvc(routes =>
             {
                 routes.MapRoute(
@@ -53,6 +53,11 @@ namespace NodeServicesExamples
         public static void Main(string[] args)
         {
             var host = new WebHostBuilder()
+                .ConfigureLogging(factory =>
+                {
+                    factory.AddConsole();
+                    factory.AddDebug();
+                })
                 .UseContentRoot(Directory.GetCurrentDirectory())
                 .UseIISIntegration()
                 .UseKestrel()
